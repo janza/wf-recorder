@@ -190,13 +190,14 @@ void FrameWriter::init_video_stream()
         videoCodecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     int err;
+    char str[256];
     if ((err = avcodec_open2(videoCodecCtx, codec, &options)) < 0)
     {
-        std::cerr << "avcodec_open2 failed: " << averr(err) << std::endl;
+        av_strerror(err, str, 256);
+        std::cerr << "avcodec_open2 failed: " << str << std::endl;
         std::exit(-1);
     }
     av_dict_free(&options);
-    videoStream->time_base = (AVRational){ 1, FPS };
 }
 
 static uint64_t get_codec_channel_layout(AVCodec *codec)
@@ -298,9 +299,13 @@ void FrameWriter::init_codecs()
     }
 
     AVDictionary *dummy = NULL;
-    if (avformat_write_header(fmtCtx, &dummy) != 0)
+    char err[256];
+    int ret = avformat_write_header(fmtCtx, &dummy);
+    if (ret != 0)
     {
         std::cerr << "Failed to write file header" << std::endl;
+        av_strerror(ret, err, 256);
+        std::cerr << err << std::endl;
         std::exit(-1);
     }
     av_dict_free(&dummy);
@@ -419,6 +424,30 @@ void FrameWriter::convert_pixels_to_yuv(const uint8_t *pixels,
     }
 }
 
+void FrameWriter::encode(AVCodecContext *enc_ctx, AVFrame *frame, AVPacket *pkt)
+{
+    int ret;
+
+    /* send the frame to the encoder */
+    ret = avcodec_send_frame(enc_ctx, frame);
+    if (ret < 0) {
+        fprintf(stderr, "error sending a frame for encoding\n");
+        return;
+    }
+
+    while (ret >= 0) {
+        ret = avcodec_receive_packet(enc_ctx, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            return;
+        else if (ret < 0) {
+            fprintf(stderr, "error during encoding\n");
+            return;
+        }
+
+        finish_frame(*pkt, true);
+    }
+}
+
 void FrameWriter::add_frame(const uint8_t* pixels, int64_t usec, bool y_invert)
 {
     /* Calculate data after y-inversion */
@@ -474,15 +503,11 @@ void FrameWriter::add_frame(const uint8_t* pixels, int64_t usec, bool y_invert)
     pkt.data = NULL;
     pkt.size = 0;
 
-    int got_output;
-    avcodec_encode_video2(videoCodecCtx, &pkt, *output_frame, &got_output);
+    encode(videoCodecCtx, *output_frame, &pkt);
 
     /* Restore frame buffer, so that it can be properly freed in the end */
     if (saved_buf0)
         encoder_frame->buf[0] = saved_buf0;
-
-    if (got_output)
-      finish_frame(pkt, true);
 }
 
 #define SRC_RATE 1e6
@@ -584,12 +609,7 @@ FrameWriter::~FrameWriter()
     AVPacket pkt;
     av_init_packet(&pkt);
 
-    for (int got_output = 1; got_output;)
-    {
-        avcodec_encode_video2(videoCodecCtx, &pkt, NULL, &got_output);
-        if (got_output)
-            finish_frame(pkt, true);
-    }
+    encode(videoCodecCtx, NULL, &pkt);
 
     for (int got_output = 1; got_output && params.enable_audio;)
     {
